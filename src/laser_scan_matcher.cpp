@@ -247,7 +247,8 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
   if (publish_tf_)
     tfB_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
   if(publish_odom_){
-    odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, rclcpp::SensorDataQoS());
+    // odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, rclcpp::SensorDataQoS());
+    odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 32); // (fabio) fix sync issue with hdl
   }
 }
 
