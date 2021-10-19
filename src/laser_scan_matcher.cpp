@@ -59,7 +59,11 @@ void LaserScanMatcher::add_parameter(
   }
 
 
-LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(false), prev_angle(0.0), prev_x(0.0), prev_y(0.0)
+LaserScanMatcher::LaserScanMatcher() : 
+  Node("laser_scan_matcher"), 
+  initialized_(false), 
+  received_odom_(false), // fabio
+  prev_angle(0.0), prev_x(0.0), prev_y(0.0)
 {
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   // Initiate parameters
@@ -83,6 +87,8 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
   add_parameter("kf_dist_angular", rclcpp::ParameterValue(10.0* (M_PI/180.0)),
     "When to generate keyframe scan.");
   
+  add_parameter("use_odom", rclcpp::ParameterValue(true),
+    "Use wheel odometry to speed up the ICP."); // fabio
 
 
   // CSM parameters - comments copied from algos.h (by Andrea Censi)
@@ -243,6 +249,12 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
 
   // Subscribers
   this->scan_filter_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>("scan", 5, std::bind(&LaserScanMatcher::scanCallback, this, std::placeholders::_1));
+  if (use_odom_) //fabio
+  {
+  this->odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+    "odom", 1, std::bind(&LaserScanMatcher::odomCallback, this, 
+    std::placeholders::_1));
+  }
   tf_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
   if (publish_tf_)
     tfB_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
@@ -257,6 +269,18 @@ LaserScanMatcher::~LaserScanMatcher()
 
 }
 
+void LaserScanMatcher::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom_msg)
+{
+  std::unique_lock<std::mutex> mutex_;
+  
+  latest_odom_msg_ = *odom_msg;
+  if (!received_odom_)
+  {
+    last_used_odom_msg_ = *odom_msg;
+    received_odom_ = true;
+  }
+  RCLCPP_INFO(get_logger(), "Got odom"); // debug
+}
 
 
 void LaserScanMatcher::createCache (const sensor_msgs::msg::LaserScan::SharedPtr& scan_msg)

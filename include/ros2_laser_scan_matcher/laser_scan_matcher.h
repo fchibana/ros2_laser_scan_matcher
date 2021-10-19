@@ -52,6 +52,8 @@
 #include <csm/csm.h>  // csm defines min and max, but Eigen complains
 #include <boost/thread.hpp>
 
+#include <mutex> // fabio
+
 
 namespace scan_tools
 {
@@ -62,11 +64,12 @@ public:
   ~LaserScanMatcher();
 
   void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr scan_msg);
-
+  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom_msg); // fabio
 private:
   // Ros handle
 
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_filter_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_; // fabio
 
   std::shared_ptr<tf2_ros::TransformListener> tf_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tfB_;
@@ -86,12 +89,25 @@ private:
   double kf_dist_linear_sq_;
   double kf_dist_angular_;
 
+  // TODO(me): Update this comment
+  // What predictions are available to speed up the ICP?
+  // 1) imu - [theta] from imu yaw angle - /imu topic
+  // 2) odom - [x, y, theta] from wheel odometry - /odom topic
+  // 3) velocity [vx, vy, vtheta], usually from ab-filter - /vel.
+  // If more than one is enabled, priority is imu > odom > velocity 
+
+  bool use_odom_; // fabio
+
   // For calculating odometry
   double prev_x;
   double prev_y;
   double prev_angle;
 
+  std::mutex mutex_; // fabio
+
   bool initialized_;
+  bool received_odom_; // fabio
+
   bool publish_odom_;
   bool publish_tf_;
 
@@ -114,6 +130,9 @@ private:
 
   rclcpp::Time last_icp_time_;
 
+  nav_msgs::msg::Odometry latest_odom_msg_; // fabio
+  nav_msgs::msg::Odometry last_used_odom_msg_; // fabio
+ 
   bool getBaseToLaserTf (const std::string& frame_id);
 
   bool processScan(LDP& curr_ldp_scan, const rclcpp::Time& time);
