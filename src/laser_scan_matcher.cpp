@@ -199,6 +199,8 @@ LaserScanMatcher::LaserScanMatcher() :
   odom_topic_   = this->get_parameter("publish_odom").as_string();
   publish_tf_   = this->get_parameter("publish_tf").as_bool(); 
 
+  use_odom_ = this->get_parameter("use_odom").as_bool(); // fabio
+
   publish_odom_ = (odom_topic_ != "");
   kf_dist_linear_sq_ = kf_dist_linear_ * kf_dist_linear_;
 
@@ -252,7 +254,7 @@ LaserScanMatcher::LaserScanMatcher() :
   if (use_odom_) //fabio
   {
   this->odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-    "odom", 1, std::bind(&LaserScanMatcher::odomCallback, this, 
+    "odom", rclcpp::SensorDataQoS(), std::bind(&LaserScanMatcher::odomCallback, this, 
     std::placeholders::_1));
   }
   tf_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
