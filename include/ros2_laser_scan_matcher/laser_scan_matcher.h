@@ -76,13 +76,17 @@ private:
   tf2::Transform base_to_laser_;  // static, cached
   tf2::Transform laser_to_base_; 
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_stamped_publisher_; // @fchibana
+
   // Coordinate parameters
   std::string map_frame_;
   std::string base_frame_;
   std::string odom_frame_;
   std::string laser_frame_;
   std::string odom_topic_;
+  std::string pose_stamped_topic_;  // @fchibana
 
   // Keyframe parameters
   double kf_dist_linear_;
@@ -108,6 +112,7 @@ private:
   bool initialized_;
   bool received_odom_; // fabio
 
+  bool publish_pose_stamped_; //@fchibana
   bool publish_odom_;
   bool publish_tf_;
 

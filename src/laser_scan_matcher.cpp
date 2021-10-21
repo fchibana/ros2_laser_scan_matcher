@@ -74,6 +74,9 @@ LaserScanMatcher::LaserScanMatcher() :
   add_parameter("publish_tf",   rclcpp::ParameterValue(false),
     " If publish tf odom->base_link");
   
+  add_parameter("publish_pose_stamped", rclcpp::ParameterValue(std::string("")),
+    "If publish pose_stamped from laser_scan. Empty if not, otherwise name of the topic");
+    
   add_parameter("base_frame", rclcpp::ParameterValue(std::string("base_link")),
     "Which frame to use for the robot base");
   add_parameter("odom_frame", rclcpp::ParameterValue(std::string("odom")),
@@ -196,13 +199,15 @@ LaserScanMatcher::LaserScanMatcher() :
   laser_frame_ = this->get_parameter("laser_frame").as_string();
   kf_dist_linear_  = this->get_parameter("kf_dist_linear").as_double();
   kf_dist_angular_ = this->get_parameter("kf_dist_angular").as_double();
+  pose_stamped_topic_  = this->get_parameter("publish_pose_stamped").as_string(); // @fchibana
   odom_topic_   = this->get_parameter("publish_odom").as_string();
-  publish_tf_   = this->get_parameter("publish_tf").as_bool(); 
-
-  use_odom_ = this->get_parameter("use_odom").as_bool(); // fabio
-
+  publish_tf_   = this->get_parameter("publish_tf").as_bool();
+  
+  publish_pose_stamped_ = (pose_stamped_topic_ != "");  // @fchibana
   publish_odom_ = (odom_topic_ != "");
   kf_dist_linear_sq_ = kf_dist_linear_ * kf_dist_linear_;
+
+  use_odom_ = this->get_parameter("use_odom").as_bool(); // @fchibana
 
   input_.max_angular_correction_deg = this->get_parameter("max_angular_correction_deg").as_double();
   input_.max_linear_correction = this->get_parameter("max_linear_correction").as_double();
@@ -264,6 +269,10 @@ LaserScanMatcher::LaserScanMatcher() :
     // odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, rclcpp::SensorDataQoS());
     odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 32); // (fabio) fix sync issue with hdl
   }
+  if(publish_pose_stamped_) {
+    pose_stamped_publisher_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+      pose_stamped_topic_, 5);
+  }
 }
 
 LaserScanMatcher::~LaserScanMatcher()
@@ -281,7 +290,7 @@ void LaserScanMatcher::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odo
     last_used_odom_msg_ = *odom_msg;
     received_odom_ = true;
   }
-  RCLCPP_INFO(get_logger(), "Got odom"); // debug
+  // RCLCPP_INFO(get_logger(), "Got odom"); // debug
 }
 
 
@@ -446,6 +455,17 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     // update the pose in the world frame
     f2b_ = f2b_kf_ * corr_ch;
 
+    if (publish_pose_stamped_)
+    {
+      // stamped Pose message
+      geometry_msgs::msg::PoseStamped pose_stamped_msg;
+      
+      pose_stamped_msg.header.stamp    = time;
+      pose_stamped_msg.header.frame_id = odom_frame_;
+      tf2::toMsg(f2b_, pose_stamped_msg.pose);
+
+      pose_stamped_publisher_->publish(pose_stamped_msg);
+    }
   }
 
   else
@@ -456,6 +476,7 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
   }
 
 
+  // FIXME(@fchibana): should publish only if output_.valid
   if (publish_odom_)
   {
     // stamped Pose message
@@ -485,7 +506,7 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     odom_publisher_->publish(odom_msg);
   }
 
-  
+  // FIXME(@fchibana): should publish only if output_.valid  
   if (publish_tf_)
   {
     geometry_msgs::msg::TransformStamped tf_msg;
