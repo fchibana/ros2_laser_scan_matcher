@@ -34,3 +34,4 @@
 # VSCode
 .vscode
 build
+src/laser_scan_matcher_ros1.cpp
