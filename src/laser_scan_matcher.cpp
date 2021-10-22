@@ -467,6 +467,8 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
   input_.first_guess[1] = pr_ch_l.getOrigin().getY();
   input_.first_guess[2] = tf2::getYaw(pr_ch_l.getRotation());
 
+  // (@fchibana) get covariance for edge messages
+  input_.do_compute_covariance = 1;
   
   // If they are non-Null, free covariance gsl matrices to avoid leaking memory
   if (output_.cov_x_m)
@@ -521,33 +523,38 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
      **********************************************************************************************/
     
     // HACK(): debugging
-    std::cerr << "Total correspondence error: " << output_.error << '\n';
-    std::cerr << "N. iterations: " << output_.iterations << '\n';
-    std::cerr << "Cov_x_m: " << output_.cov_x_m << '\n';
-    
+    RCLCPP_INFO(
+      get_logger(),
+      "scan matching (error, n. iter.): (%f, %i)",
+      output_.error, 
+      output_.iterations
+    );
+        
     edge_stamped_msg_.header.stamp = time;
     edge_stamped_msg_.header.frame_id = base_frame_;
     
     tf2::toMsg(corr_ch, edge_stamped_msg_.pose.pose);
-        
-    // FIXME(): SEGDEV err
-    // double cov00 = gsl_matrix_get(output_.cov_x_m, 0, 0); 
-    // double cov11 = gsl_matrix_get(output_.cov_x_m, 0, 1); 
-    // double cov55 = gsl_matrix_get(output_.cov_x_m, 0, 2)
     
-    // HACK(): just for now
-    double cov00 = 1e-3; 
-    double cov11 = 1e-3;
-    double cov55 = 1e-3;
-
-    // UPDATE: See ros1 version around line 605! There's a `input.do_compute_covariance`
-
+    double cov00, cov11, cov55;
+    if (input_.do_compute_covariance) {
+      cov00 = gsl_matrix_get(output_.cov_x_m, 0, 0);  // sigma_x 
+      cov11 = gsl_matrix_get(output_.cov_x_m, 0, 1);  // sigma_y
+      cov55 = gsl_matrix_get(output_.cov_x_m, 0, 2);   // sigma_yaw
+    } else {
+      cov00 = static_cast<double>(position_covariance_[0]);
+      cov11 = static_cast<double>(position_covariance_[1]);
+      cov55 = static_cast<double>(orientation_covariance_[2]);
+    }
+    double cov22 = static_cast<double>(position_covariance_[2]);
+    double cov33 = static_cast<double>(orientation_covariance_[0]);
+    double cov44 = static_cast<double>(orientation_covariance_[1]);
+    
     edge_stamped_msg_.pose.covariance = boost::assign::list_of
       (cov00) (0)  (0)  (0)  (0)  (0)
       (0)  (cov11) (0)  (0)  (0)  (0)
-      (0)  (0)  (static_cast<double>(position_covariance_[2])) (0)  (0)  (0)
-      (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[0])) (0)  (0)
-      (0)  (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[1])) (0)
+      (0)  (0)  (cov22) (0)  (0)  (0)
+      (0)  (0)  (0)  (cov33) (0)  (0)
+      (0)  (0)  (0)  (0)  (cov44) (0)
       (0)  (0)  (0)  (0)  (0)  (cov55);
     /**********************************************************************************************/
         
@@ -675,13 +682,27 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
 
       tf2::toMsg(corr_ch_e, h_edge_stamped_msg_[i].pose.pose);
 
+      double cov00, cov11, cov55;
+      if (input_.do_compute_covariance) {
+        cov00 = gsl_matrix_get(output_.cov_x_m, 0, 0);  // sigma_x 
+        cov11 = gsl_matrix_get(output_.cov_x_m, 0, 1);  // sigma_y
+        cov55 = gsl_matrix_get(output_.cov_x_m, 0, 2);   // sigma_yaw
+      } else {
+        cov00 = static_cast<double>(position_covariance_[0]);
+        cov11 = static_cast<double>(position_covariance_[1]);
+        cov55 = static_cast<double>(orientation_covariance_[2]);
+      }
+      double cov22 = static_cast<double>(position_covariance_[2]);
+      double cov33 = static_cast<double>(orientation_covariance_[0]);
+      double cov44 = static_cast<double>(orientation_covariance_[1]);
+      
       h_edge_stamped_msg_[i].pose.covariance = boost::assign::list_of
-        (gsl_matrix_get(output_.cov_x_m, 0, 0)) (0)  (0)  (0)  (0)  (0)
-        (0)  (gsl_matrix_get(output_.cov_x_m, 0, 1)) (0)  (0)  (0)  (0)
-        (0)  (0)  (static_cast<double>(position_covariance_[2])) (0)  (0)  (0)
-        (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[0])) (0)  (0)
-        (0)  (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[1])) (0)
-        (0)  (0)  (0)  (0)  (0)  (gsl_matrix_get(output_.cov_x_m, 0, 2));
+        (cov00) (0)  (0)  (0)  (0)  (0)
+        (0)  (cov11) (0)  (0)  (0)  (0)
+        (0)  (0)  (cov22) (0)  (0)  (0)
+        (0)  (0)  (0)  (cov33) (0)  (0)
+        (0)  (0)  (0)  (0)  (cov44) (0)
+        (0)  (0)  (0)  (0)  (0)  (cov55);
     } else {
       RCLCPP_WARN(get_logger(), "Could not compute %i -th history edge ", i);
     }
