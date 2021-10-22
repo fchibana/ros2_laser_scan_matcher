@@ -124,12 +124,14 @@ private:
 
   rclcpp::Time last_icp_time_;
 
-  // New members ---------------------------------------------------------------
-  // Publishing pose stamped (for mapping?)
-  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_stamped_publisher_;
-  std::string pose_stamped_topic_;
-  bool publish_pose_stamped_;
-
+  /*************************************************************************************************
+   * (@fchibana) New stuff
+   * 
+   * Notes
+   * - If we create and publish the edge history edge messages in the same scope, we don't need
+   *   to declare them as member variables.
+  *************************************************************************************************/ 
+  
   // For odomCallback()
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   nav_msgs::msg::Odometry latest_odom_msg_;
@@ -138,13 +140,21 @@ private:
   bool received_odom_;
   std::mutex mutex_;
 
+  // For messages with covariance 
+  std::vector<double> position_covariance_;
+  std::vector<double> orientation_covariance_;
+  
+  // Publishing pose stamped (for mapping?)
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_stamped_publisher_;
+  std::string pose_stamped_topic_;
+  bool publish_pose_stamped_;
+
   // # stuff for slam (move somewhere else?)
     
   // ## publish edge
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr edge_publisher_;
   geometry_msgs::msg::PoseWithCovarianceStamped edge_stamped_msg_;  // FIXME(): needs to be member var?
-  std::vector<double> position_covariance_;
-  std::vector<double> orientation_covariance_;
+  
 
   // ## publish history edges
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr h_edge_publisher_;
@@ -152,11 +162,11 @@ private:
   int history_;
   LDP history_pre_ldp_scan_[50];
   tf2::Transform corr_ch_l_old_[50];
-  
-  // What is this for!?
   // sensor_msgs::msg::LaserScan::ConstPtr scan_msg_global_;
-  // sensor_msgs::msg::LaserScan::ConstPtr scan_msg_[50];
-  // New members end -----------------------------------------------------------
+  sensor_msgs::msg::LaserScan::SharedPtr scan_msg_global_;
+  // sensor_msgs::msg::LaserScan::ConstPtr scan_msgs_[50];
+  sensor_msgs::msg::LaserScan::SharedPtr scan_msgs_[50];
+  /************************************************************************************************/
  
   bool getBaseToLaserTf (const std::string& frame_id);
 

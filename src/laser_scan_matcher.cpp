@@ -250,39 +250,52 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
     odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, rclcpp::SensorDataQoS());
   }
   
-  // New stuff -----------------------------------------------------------------
-  // Odometry subscriber
+  /*************************************************************************************************
+   * (@fchibana) New stuff
+  *************************************************************************************************/ 
+  
+  // For odomCallback()
   received_odom_ = false; // fabio
   add_parameter("use_odom", rclcpp::ParameterValue(true),
-    "Use wheel odometry to speed up the ICP."); // fabio
-  use_odom_ = this->get_parameter("use_odom").as_bool(); // @fchibana
+    "Use wheel odometry to speed up the ICP.");
+
+  use_odom_ = this->get_parameter("use_odom").as_bool();
   if (use_odom_) {
-  this->odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-    "odom", rclcpp::SensorDataQoS(), std::bind(&LaserScanMatcher::odomCallback, this, 
-    std::placeholders::_1));
+    this->odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+      "odom", rclcpp::SensorDataQoS(),
+      std::bind(&LaserScanMatcher::odomCallback, this, std::placeholders::_1));
   }
 
-  // Pose stamped publisher
-  add_parameter("publish_pose_stamped", rclcpp::ParameterValue(std::string("")),
-    "If publish pose_stamped from laser_scan. Empty if not, otherwise name of the topic");
-  pose_stamped_topic_  = this->get_parameter("publish_pose_stamped").as_string(); // @fchibana
-  publish_pose_stamped_ = (pose_stamped_topic_ != "");  // @fchibana
-  if(publish_pose_stamped_) {
-    pose_stamped_publisher_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
-      pose_stamped_topic_, 5);
-  }
-
-  // Edge publisher // TODO(): turn into node parameter
-  edge_publisher_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
-    "edge", 5);
-
+  // For messages with covariance
   // FIXME(@fchibana): turn into node parameter
   position_covariance_.resize(3);
   std::fill(position_covariance_.begin(), position_covariance_.end(), 1e-9);
   orientation_covariance_.resize(3);
   std::fill(orientation_covariance_.begin(), orientation_covariance_.end(), 1e-9);
-   
-  // New stuff end--------------------------------------------------------------
+
+  // Publishing pose stamped (for mapping?)
+  add_parameter("publish_pose_stamped", rclcpp::ParameterValue(std::string("")),
+    "If publish pose_stamped from laser_scan. Empty if not, otherwise name of the topic");
+  pose_stamped_topic_  = this->get_parameter("publish_pose_stamped").as_string();
+  publish_pose_stamped_ = (pose_stamped_topic_ != "");
+  if(publish_pose_stamped_) {
+    pose_stamped_publisher_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+      pose_stamped_topic_, 5);
+  }
+
+  // # stuff for slam (move somewhere else?)
+    
+  // ## publish edge
+  // TODO(): turn into node parameter
+  edge_publisher_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    "edge", 5);
+
+  // ## publish history edges
+  // TODO(): turn into node parameter
+  h_edge_publisher_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    "history_edge", 10);
+  history_ = 2;   // TODO(): turn into node parameter
+  /************************************************************************************************/
 }
 
 LaserScanMatcher::~LaserScanMatcher()
@@ -339,10 +352,34 @@ void LaserScanMatcher::scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr
     laserScanToLDP(scan_msg, prev_ldp_scan_);
     last_icp_time_ = scan_msg->header.stamp;
     initialized_ = true;
+
+    /***********************************************************************************************
+     * (@fchibana) Array of past scans
+    **********************************************************************************************/
+    for (int i = 0; i <= history_; i++) {
+      scan_msgs_[i] = scan_msg;
+    }
+    /***********************************************************************************************/ 
   }
 
   LDP curr_ldp_scan;
   laserScanToLDP(scan_msg, curr_ldp_scan);
+  /***********************************************************************************************
+   * (@fchibana) Convert past scans into LDP
+   * 
+   * Note that we don't use the 0-th item.
+   * ROS1 version: processScan also takes in history_pre_ldp_scan. But since we declared it as a 
+   * member variable, it we don't need to.
+   * 
+   * scan_msg_global_ is used to update the 0-th component of scan_msgs_ after we publish the kf.
+   * 
+  **********************************************************************************************/
+  for (int i = 1; i <= history_; i++) {
+    laserScanToLDP(scan_msgs_[i], history_pre_ldp_scan_[i]);
+  }
+
+  scan_msg_global_ = scan_msg;
+  /***********************************************************************************************/ 
   processScan(curr_ldp_scan, scan_msg->header.stamp);
 }
 
@@ -430,7 +467,7 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
   input_.first_guess[1] = pr_ch_l.getOrigin().getY();
   input_.first_guess[2] = tf2::getYaw(pr_ch_l.getRotation());
 
-
+  
   // If they are non-Null, free covariance gsl matrices to avoid leaking memory
   if (output_.cov_x_m)
   {
@@ -452,13 +489,11 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
 
   sm_icp(&input_, &output_);
   tf2::Transform corr_ch;
+  tf2::Transform corr_ch_l;
   
   if (output_.valid)
   {
-    
-    
     // the correction of the laser's position, in the laser frame
-    tf2::Transform corr_ch_l;
     createTfFromXYTheta(output_.x[0], output_.x[1], output_.x[2], corr_ch_l);
 
     // the correction of the base's position, in the base frame
@@ -467,30 +502,24 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     // update the pose in the world frame
     f2b_ = f2b_kf_ * corr_ch;
 
-    //------------------------------------------------------- ADD BY FRANK ------------------------------------------------------//
-    //------------------------------------------------------ Edge Publisher -----------------------------------------------------//
-    /*ROS1**********************************************************************
-    // publish edge:corr_ch (stamped Pose message) 
-
-    //geometry_msgs::PoseWithCovarianceStamped::Ptr edge_stamped_msg;
-    edge_stamped_msg = boost::make_shared<geometry_msgs::PoseWithCovarianceStamped>();
-
-    edge_stamped_msg->header.stamp    = time;
-    edge_stamped_msg->header.frame_id = base_frame_;
-
-    tf::poseTFToMsg(corr_ch, edge_stamped_msg->pose.pose);
-
-    edge_stamped_msg->pose.covariance = boost::assign::list_of
-      (gsl_matrix_get(output_.cov_x_m, 0, 0)) (0)  (0)  (0)  (0)  (0)
-      (0)  (gsl_matrix_get(output_.cov_x_m, 0, 1)) (0)  (0)  (0)  (0)
-      (0)  (0)  (static_cast<double>(position_covariance_[2])) (0)  (0)  (0)
-      (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[0])) (0)  (0)
-      (0)  (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[1])) (0)
-      (0)  (0)  (0)  (0)  (0)  (gsl_matrix_get(output_.cov_x_m, 0, 2));
-
-    //edge_publisher_.publish(edge_stamped_msg);
-    ***************************************************************************/
-
+    /***********************************************************************************************
+     * (@fchibana) Prepare (odometry) edge message
+     * 
+     * The odometry edge is published as a PoseWithCovarianceStamped message.
+     * The pose field corresponds to `corr_ch`, the correction in the laser's
+     * pose in the fixed frame (i.e. the distance between the current node and 
+     * the previous one).
+     * The standard deviations in x, y, and theta come from the scan matching's 
+     * output (`output_.cov_x_m`).
+     * For z, roll and pitch, we use the array parameters `position_covariance`
+     * and `orientation_covariance`.
+     * 
+     * TODO:
+     * - This message is published only if a new keyframe is needed (see below).
+     * Perhaps it's better to move it there.
+     * - Can we use and eigen matrix instad of boost::assign::list_of?
+     **********************************************************************************************/
+    
     // HACK(): debugging
     std::cerr << "Total correspondence error: " << output_.error << '\n';
     std::cerr << "N. iterations: " << output_.iterations << '\n';
@@ -511,19 +540,17 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     double cov11 = 1e-3;
     double cov55 = 1e-3;
 
+    // UPDATE: See ros1 version around line 605! There's a `input.do_compute_covariance`
+
     edge_stamped_msg_.pose.covariance = boost::assign::list_of
-        (cov00) (0)  (0)  (0)  (0)  (0)
-        (0)  (cov11) (0)  (0)  (0)  (0)
-        (0)  (0)  (static_cast<double>(position_covariance_[2])) (0)  (0)  (0)
-        (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[0])) (0)  (0)
-        (0)  (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[1])) (0)
-        (0)  (0)  (0)  (0)  (0)  (cov55);
-
-    // RCLCPP_INFO(get_logger(), "Computed edge");
-
-    //----------------------------------------------------------- END ----------------------------------------------------------//
-
-
+      (cov00) (0)  (0)  (0)  (0)  (0)
+      (0)  (cov11) (0)  (0)  (0)  (0)
+      (0)  (0)  (static_cast<double>(position_covariance_[2])) (0)  (0)  (0)
+      (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[0])) (0)  (0)
+      (0)  (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[1])) (0)
+      (0)  (0)  (0)  (0)  (0)  (cov55);
+    /**********************************************************************************************/
+        
     if (publish_pose_stamped_)
     {
       // stamped Pose message
@@ -546,6 +573,7 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
 
 
   // FIXME(@fchibana): should publish only if output_.valid
+  // Update: the output is valid! If it weren't, this method would've returned!
   if (publish_odom_)
   {
     // stamped Pose message
@@ -575,7 +603,6 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     odom_publisher_->publish(odom_msg);
   }
 
-  // FIXME(@fchibana): should publish only if output_.valid  
   if (publish_tf_)
   {
     geometry_msgs::msg::TransformStamped tf_msg;
@@ -594,45 +621,112 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     tfB_->sendTransform (tf_msg);
   }
 
+  /*************************************************************************************************
+   * (@fchibana) Compute history edges
+   * 
+   * To compute the history edges we do scan matching between the current scan
+   * and one from a previous one (stores in `history_pre_ldp_scan_` array)
+   * 
+   * 
+   * TODO:
+   * -  What about history_pre_ld_scan_[0]? 
+   * - only create history edge if new kf is needed
+  *************************************************************************************************/
+  for(int i = 1; i <= history_; i++) {
+    
+    input_.laser_ref = history_pre_ldp_scan_[i];
+    input_.laser_sens = curr_ldp_scan;
+
+    // Estimate the transformation for this history edge
+
+    tf2::Transform corr_ch_l_old_sum;
+    createTfFromXYTheta(0.0, 0.0, 0.0, corr_ch_l_old_sum);
+
+    for(int j = 0; j < i; j++) {
+      corr_ch_l_old_sum = corr_ch_l_old_sum * corr_ch_l_old_[j];
+    }
+
+    // predicted change corresponding to the history edge
+    auto pr_ch_l_e = corr_ch_l_old_sum * pr_ch_l;
+
+    input_.first_guess[0] = pr_ch_l_e.getOrigin().getX();
+    input_.first_guess[1] = pr_ch_l_e.getOrigin().getY();
+    input_.first_guess[2] = tf2::getYaw(pr_ch_l_e.getRotation());
+
+    // TODO: Don't we need to free the covariance matrices?
+
+    // scan matching
+    sm_icp(&input_, &output_);
+
+    // the correction of the edge's pose, in the base frame
+    tf2::Transform corr_ch_e;
+
+    if (output_.valid) {
+      // the correction of the edge's pose, in the laser frame
+      tf2::Transform corr_ch_l_e;
+      createTfFromXYTheta(output_.x[0], output_.x[1], output_.x[2], corr_ch_l_e);
+      
+      corr_ch_e = base_to_laser_ * corr_ch_l_e * laser_to_base_;
+
+
+      // create history edge message
+      h_edge_stamped_msg_[i].header.stamp = time;
+      h_edge_stamped_msg_[i].header.frame_id = std::to_string(i);
+
+      tf2::toMsg(corr_ch_e, h_edge_stamped_msg_[i].pose.pose);
+
+      h_edge_stamped_msg_[i].pose.covariance = boost::assign::list_of
+        (gsl_matrix_get(output_.cov_x_m, 0, 0)) (0)  (0)  (0)  (0)  (0)
+        (0)  (gsl_matrix_get(output_.cov_x_m, 0, 1)) (0)  (0)  (0)  (0)
+        (0)  (0)  (static_cast<double>(position_covariance_[2])) (0)  (0)  (0)
+        (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[0])) (0)  (0)
+        (0)  (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[1])) (0)
+        (0)  (0)  (0)  (0)  (0)  (gsl_matrix_get(output_.cov_x_m, 0, 2));
+    } else {
+      RCLCPP_WARN(get_logger(), "Could not compute %i -th history edge ", i);
+    }
+
+  }
+  /************************************************************************************************/
+  
   // **** swap old and new
   if (newKeyframeNeeded(corr_ch))
   {
-    // generate a keyframe
-    ld_free(prev_ldp_scan_);
-    prev_ldp_scan_ = curr_ldp_scan;
-    //------------------------------------------------------- ADD BY FRANK ------------------------------------------------------//
-    /*ROS1**********************************************************************
-    // UPDATE //
-    for(int i=history; i>0; i--){scan_msg[i] = scan_msg[i-1];}
-    scan_msg[0] = scan_msg_global;
-    for(int i=history; i>1; i--){corr_ch_l_old[i-1] = corr_ch_l_old[i-2];}
-    corr_ch_l_old[0] = corr_ch_l;
+    /***********************************************************************************************
+     * (@fchibana) Publish edge messages
+     * 
+     * Here we just publish the edge and history edge messages. 
+     * We also update the array of history scans (`scan_msgs_`) and edges 
+     * (corr_ch_l_old)
+     * 
+     **********************************************************************************************/  
+    
+    // update array of previous scans
+    for (int i = history_; i > 0; i--) {
+      scan_msgs_[i] = scan_msgs_[i-1];
+    }
+    scan_msgs_[0] = scan_msg_global_;
 
-    for(int i=1; i<=history; i++){
-	  history_edge_publisher.publish(h_edge_stamped_msg[i]);
+    // update array of previous edges
+    for (int i = history_; i > 1; i--) {
+      corr_ch_l_old_[i-1] = corr_ch_l_old_[i-2];
+    }
+    corr_ch_l_old_[0] = corr_ch_l;
+
+    // publish 
+    for (int i = 1; i <= history_; i++) {
+      h_edge_publisher_->publish(h_edge_stamped_msg_[i]);
     }
     // TODO : Should switch to non-block delay
     usleep(3000);
-    edge_publisher_.publish(edge_stamped_msg);
-    // END UPDATE //
-    ***************************************************************************/
-    // for (int i = history_; i > 0; i--) {
-    //   scan_msg_[i] = scan_msg_[i-1];
-    // }
-    // scan_msg_[0] = scan_msg_global_;
-    // for (int i = history_; i > 1; i--) {
-    //   corr_ch_l_old_[i-1] = corr_ch_l_old_[i-2];
-    // }
-    // corr_ch_l_old_[0] = corr_ch_l;
-
-    // for (int i = 1; i <= history_; i++) {
-    //   h_edge_publisher_->publish(h_edge_stamped_msg_[i]);
-    // }
-    // TODO : Should switch to non-block delay
-    usleep(3000);
     edge_publisher_->publish(edge_stamped_msg_);
+    
     RCLCPP_INFO(get_logger(), "Published edge");
-    //----------------------------------------------------------- END ----------------------------------------------------------//
+    /**********************************************************************************************/
+    
+    // generate a keyframe
+    ld_free(prev_ldp_scan_);
+    prev_ldp_scan_ = curr_ldp_scan;
     f2b_kf_ = f2b_;
 
   }
