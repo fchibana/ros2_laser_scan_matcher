@@ -191,7 +191,7 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
   kf_dist_linear_  = this->get_parameter("kf_dist_linear").as_double();
   kf_dist_angular_ = this->get_parameter("kf_dist_angular").as_double();
   odom_topic_   = this->get_parameter("publish_odom").as_string();
-  publish_tf_   = this->get_parameter("publish_tf").as_bool(); 
+  publish_tf_   = this->get_parameter("publish_tf").as_bool();
 
   publish_odom_ = (odom_topic_ != "");
   kf_dist_linear_sq_ = kf_dist_linear_ * kf_dist_linear_;
@@ -247,9 +247,42 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
   if (publish_tf_)
     tfB_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
   if(publish_odom_){
-    // odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, rclcpp::SensorDataQoS());
-    odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 32); // (fabio) fix sync issue with hdl
+    odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, rclcpp::SensorDataQoS());
   }
+  
+  // New stuff -----------------------------------------------------------------
+  // Odometry subscriber
+  received_odom_ = false; // fabio
+  add_parameter("use_odom", rclcpp::ParameterValue(true),
+    "Use wheel odometry to speed up the ICP."); // fabio
+  use_odom_ = this->get_parameter("use_odom").as_bool(); // @fchibana
+  if (use_odom_) {
+  this->odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+    "odom", rclcpp::SensorDataQoS(), std::bind(&LaserScanMatcher::odomCallback, this, 
+    std::placeholders::_1));
+  }
+
+  // Pose stamped publisher
+  add_parameter("publish_pose_stamped", rclcpp::ParameterValue(std::string("")),
+    "If publish pose_stamped from laser_scan. Empty if not, otherwise name of the topic");
+  pose_stamped_topic_  = this->get_parameter("publish_pose_stamped").as_string(); // @fchibana
+  publish_pose_stamped_ = (pose_stamped_topic_ != "");  // @fchibana
+  if(publish_pose_stamped_) {
+    pose_stamped_publisher_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+      pose_stamped_topic_, 5);
+  }
+
+  // Edge publisher // TODO(): turn into node parameter
+  edge_publisher_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+    "edge", 5);
+
+  // FIXME(@fchibana): turn into node parameter
+  position_covariance_.resize(3);
+  std::fill(position_covariance_.begin(), position_covariance_.end(), 1e-9);
+  orientation_covariance_.resize(3);
+  std::fill(orientation_covariance_.begin(), orientation_covariance_.end(), 1e-9);
+   
+  // New stuff end--------------------------------------------------------------
 }
 
 LaserScanMatcher::~LaserScanMatcher()
@@ -257,6 +290,18 @@ LaserScanMatcher::~LaserScanMatcher()
 
 }
 
+void LaserScanMatcher::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom_msg)
+{
+  std::unique_lock<std::mutex> mutex_;
+  
+  latest_odom_msg_ = *odom_msg;
+  if (!received_odom_)
+  {
+    last_used_odom_msg_ = *odom_msg;
+    received_odom_ = true;
+  }
+  // RCLCPP_INFO(get_logger(), "Got odom"); // debug
+}
 
 
 void LaserScanMatcher::createCache (const sensor_msgs::msg::LaserScan::SharedPtr& scan_msg)
@@ -407,9 +452,11 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
 
   sm_icp(&input_, &output_);
   tf2::Transform corr_ch;
-
+  
   if (output_.valid)
   {
+    
+    
     // the correction of the laser's position, in the laser frame
     tf2::Transform corr_ch_l;
     createTfFromXYTheta(output_.x[0], output_.x[1], output_.x[2], corr_ch_l);
@@ -420,6 +467,74 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     // update the pose in the world frame
     f2b_ = f2b_kf_ * corr_ch;
 
+    //------------------------------------------------------- ADD BY FRANK ------------------------------------------------------//
+    //------------------------------------------------------ Edge Publisher -----------------------------------------------------//
+    /*ROS1**********************************************************************
+    // publish edge:corr_ch (stamped Pose message) 
+
+    //geometry_msgs::PoseWithCovarianceStamped::Ptr edge_stamped_msg;
+    edge_stamped_msg = boost::make_shared<geometry_msgs::PoseWithCovarianceStamped>();
+
+    edge_stamped_msg->header.stamp    = time;
+    edge_stamped_msg->header.frame_id = base_frame_;
+
+    tf::poseTFToMsg(corr_ch, edge_stamped_msg->pose.pose);
+
+    edge_stamped_msg->pose.covariance = boost::assign::list_of
+      (gsl_matrix_get(output_.cov_x_m, 0, 0)) (0)  (0)  (0)  (0)  (0)
+      (0)  (gsl_matrix_get(output_.cov_x_m, 0, 1)) (0)  (0)  (0)  (0)
+      (0)  (0)  (static_cast<double>(position_covariance_[2])) (0)  (0)  (0)
+      (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[0])) (0)  (0)
+      (0)  (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[1])) (0)
+      (0)  (0)  (0)  (0)  (0)  (gsl_matrix_get(output_.cov_x_m, 0, 2));
+
+    //edge_publisher_.publish(edge_stamped_msg);
+    ***************************************************************************/
+
+    // HACK(): debugging
+    std::cerr << "Total correspondence error: " << output_.error << '\n';
+    std::cerr << "N. iterations: " << output_.iterations << '\n';
+    std::cerr << "Cov_x_m: " << output_.cov_x_m << '\n';
+    
+    edge_stamped_msg_.header.stamp = time;
+    edge_stamped_msg_.header.frame_id = base_frame_;
+    
+    tf2::toMsg(corr_ch, edge_stamped_msg_.pose.pose);
+        
+    // FIXME(): SEGDEV err
+    // double cov00 = gsl_matrix_get(output_.cov_x_m, 0, 0); 
+    // double cov11 = gsl_matrix_get(output_.cov_x_m, 0, 1); 
+    // double cov55 = gsl_matrix_get(output_.cov_x_m, 0, 2)
+    
+    // HACK(): just for now
+    double cov00 = 1e-3; 
+    double cov11 = 1e-3;
+    double cov55 = 1e-3;
+
+    edge_stamped_msg_.pose.covariance = boost::assign::list_of
+        (cov00) (0)  (0)  (0)  (0)  (0)
+        (0)  (cov11) (0)  (0)  (0)  (0)
+        (0)  (0)  (static_cast<double>(position_covariance_[2])) (0)  (0)  (0)
+        (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[0])) (0)  (0)
+        (0)  (0)  (0)  (0)  (static_cast<double>(orientation_covariance_[1])) (0)
+        (0)  (0)  (0)  (0)  (0)  (cov55);
+
+    // RCLCPP_INFO(get_logger(), "Computed edge");
+
+    //----------------------------------------------------------- END ----------------------------------------------------------//
+
+
+    if (publish_pose_stamped_)
+    {
+      // stamped Pose message
+      geometry_msgs::msg::PoseStamped pose_stamped_msg;
+      
+      pose_stamped_msg.header.stamp = time;
+      pose_stamped_msg.header.frame_id = odom_frame_;
+      tf2::toMsg(f2b_, pose_stamped_msg.pose);
+
+      pose_stamped_publisher_->publish(pose_stamped_msg);
+    }
   }
 
   else
@@ -430,6 +545,7 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
   }
 
 
+  // FIXME(@fchibana): should publish only if output_.valid
   if (publish_odom_)
   {
     // stamped Pose message
@@ -459,7 +575,7 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     odom_publisher_->publish(odom_msg);
   }
 
-  
+  // FIXME(@fchibana): should publish only if output_.valid  
   if (publish_tf_)
   {
     geometry_msgs::msg::TransformStamped tf_msg;
@@ -484,6 +600,39 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     // generate a keyframe
     ld_free(prev_ldp_scan_);
     prev_ldp_scan_ = curr_ldp_scan;
+    //------------------------------------------------------- ADD BY FRANK ------------------------------------------------------//
+    /*ROS1**********************************************************************
+    // UPDATE //
+    for(int i=history; i>0; i--){scan_msg[i] = scan_msg[i-1];}
+    scan_msg[0] = scan_msg_global;
+    for(int i=history; i>1; i--){corr_ch_l_old[i-1] = corr_ch_l_old[i-2];}
+    corr_ch_l_old[0] = corr_ch_l;
+
+    for(int i=1; i<=history; i++){
+	  history_edge_publisher.publish(h_edge_stamped_msg[i]);
+    }
+    // TODO : Should switch to non-block delay
+    usleep(3000);
+    edge_publisher_.publish(edge_stamped_msg);
+    // END UPDATE //
+    ***************************************************************************/
+    // for (int i = history_; i > 0; i--) {
+    //   scan_msg_[i] = scan_msg_[i-1];
+    // }
+    // scan_msg_[0] = scan_msg_global_;
+    // for (int i = history_; i > 1; i--) {
+    //   corr_ch_l_old_[i-1] = corr_ch_l_old_[i-2];
+    // }
+    // corr_ch_l_old_[0] = corr_ch_l;
+
+    // for (int i = 1; i <= history_; i++) {
+    //   h_edge_publisher_->publish(h_edge_stamped_msg_[i]);
+    // }
+    // TODO : Should switch to non-block delay
+    usleep(3000);
+    edge_publisher_->publish(edge_stamped_msg_);
+    RCLCPP_INFO(get_logger(), "Published edge");
+    //----------------------------------------------------------- END ----------------------------------------------------------//
     f2b_kf_ = f2b_;
 
   }

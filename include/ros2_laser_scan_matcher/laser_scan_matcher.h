@@ -52,6 +52,9 @@
 #include <csm/csm.h>  // csm defines min and max, but Eigen complains
 #include <boost/thread.hpp>
 
+#include <boost/assign.hpp>   // @fchibana
+#include <mutex>              // @fchibana
+
 
 namespace scan_tools
 {
@@ -62,12 +65,12 @@ public:
   ~LaserScanMatcher();
 
   void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr scan_msg);
-
+  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom_msg); // fabio
 private:
   // Ros handle
 
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_filter_sub_;
-
+  
   std::shared_ptr<tf2_ros::TransformListener> tf_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tfB_;
   tf2::Transform base_to_laser_;  // static, cached
@@ -80,11 +83,18 @@ private:
   std::string odom_frame_;
   std::string laser_frame_;
   std::string odom_topic_;
-
+  
   // Keyframe parameters
   double kf_dist_linear_;
   double kf_dist_linear_sq_;
   double kf_dist_angular_;
+
+  // TODO(me): Update this comment
+  // What predictions are available to speed up the ICP?
+  // 1) imu - [theta] from imu yaw angle - /imu topic
+  // 2) odom - [x, y, theta] from wheel odometry - /odom topic
+  // 3) velocity [vx, vy, vtheta], usually from ab-filter - /vel.
+  // If more than one is enabled, priority is imu > odom > velocity 
 
   // For calculating odometry
   double prev_x;
@@ -114,6 +124,35 @@ private:
 
   rclcpp::Time last_icp_time_;
 
+  // New members ---------------------------------------------------------------
+  // Publishing pose stamped (for mapping?)
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_stamped_publisher_; // @fchibana
+  std::string pose_stamped_topic_;  // @fchibana
+  bool publish_pose_stamped_; // @fchibana
+
+  // For odomCallback()
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_; // fabio
+  nav_msgs::msg::Odometry latest_odom_msg_; // fabio
+  nav_msgs::msg::Odometry last_used_odom_msg_; // fabio
+  bool use_odom_; // @fchibana
+  bool received_odom_; // @fchibana
+  std::mutex mutex_; // @fchibana
+
+
+  // stuff for slam (move somewhere else?)
+  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr edge_publisher_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr h_edge_publisher_;
+  std::vector<double> position_covariance_;       // @fchibana
+  std::vector<double> orientation_covariance_;    // @fchibana
+  int history_;
+  LDP history_pre_ldp_scan_[50];
+  tf2::Transform corr_ch_l_old_[50];
+  sensor_msgs::msg::LaserScan::ConstPtr scan_msg_global_;
+  sensor_msgs::msg::LaserScan::ConstPtr scan_msg_[50];
+  geometry_msgs::msg::PoseWithCovarianceStamped edge_stamped_msg_;  // FIXME(): needs to be member var?
+  geometry_msgs::msg::PoseWithCovarianceStamped h_edge_stamped_msg_[50];  // FIXME(): needs to be member var?
+  // New members end -----------------------------------------------------------
+ 
   bool getBaseToLaserTf (const std::string& frame_id);
 
   bool processScan(LDP& curr_ldp_scan, const rclcpp::Time& time);
