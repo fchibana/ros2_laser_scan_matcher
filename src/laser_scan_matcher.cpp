@@ -261,6 +261,9 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
 
   use_odom_ = this->get_parameter("use_odom").as_bool();
   if (use_odom_) {
+
+    RCLCPP_INFO(get_logger(), "Using wheel odometry as initial guess for ICP");
+    
     this->odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
       "odom", rclcpp::SensorDataQoS(),
       std::bind(&LaserScanMatcher::odomCallback, this, std::placeholders::_1));
@@ -335,11 +338,12 @@ void LaserScanMatcher::createCache (const sensor_msgs::msg::LaserScan::SharedPtr
 
 
 void LaserScanMatcher::scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr scan_msg)
-
 {
 
   if (!initialized_)
   {
+    RCLCPP_INFO(get_logger(), "initializing scanCallback() ...");
+
     createCache(scan_msg);    // caches the sin and cos of all angles
 
     // cache the static tf from base to laser
@@ -448,12 +452,19 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
 
   double dt = (now() - last_icp_time_).nanoseconds()/1e+9;
   double pr_ch_x, pr_ch_y, pr_ch_a;
+  getPrediction(pr_ch_x, pr_ch_y, pr_ch_a, dt);
   
+  RCLCPP_INFO(
+    get_logger(),
+    "pr ch (x, y, yaw): (%f, %f, %f)",
+    pr_ch_x, pr_ch_y, pr_ch_a
+  );
 
   // the predicted change of the laser's position, in the fixed frame
 
   tf2::Transform pr_ch;
-  createTfFromXYTheta(0.0,0.0,0.0, pr_ch);
+  // createTfFromXYTheta(0.0,0.0,0.0, pr_ch);
+  createTfFromXYTheta(pr_ch_x, pr_ch_y, pr_ch_a, pr_ch);
 
   // account for the change since the last kf, in the fixed frame
 
@@ -508,17 +519,16 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
      * (@fchibana) Prepare (odometry) edge message
      * 
      * The odometry edge is published as a PoseWithCovarianceStamped message.
-     * The pose field corresponds to `corr_ch`, the correction in the laser's
-     * pose in the fixed frame (i.e. the distance between the current node and 
-     * the previous one).
-     * The standard deviations in x, y, and theta come from the scan matching's 
-     * output (`output_.cov_x_m`).
-     * For z, roll and pitch, we use the array parameters `position_covariance`
-     * and `orientation_covariance`.
+     * The pose field corresponds to `corr_ch`, the correction in the laser's pose in the fixed 
+     * frame (i.e. the distance between the current node and the previous one).
+     * The standard deviations in x, y, and theta come from the scan matching's output 
+     * (`output_.cov_x_m`).
+     * For z, roll and pitch, we use the array parameters `position_covariance` and 
+     * `orientation_covariance`.
      * 
      * TODO:
-     * - This message is published only if a new keyframe is needed (see below).
-     * Perhaps it's better to move it there.
+     * - This message is published only if a new keyframe is needed (see below). Perhaps it's better
+     * to move it there.
      * - Can we use and eigen matrix instad of boost::assign::list_of?
      **********************************************************************************************/
     
@@ -578,9 +588,8 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     return false;
   }
 
-
-  // FIXME(@fchibana): should publish only if output_.valid
-  // Update: the output is valid! If it weren't, this method would've returned!
+  std::cerr.boolalpha;
+  std::cerr << "publish_odom: " << publish_odom_;
   if (publish_odom_)
   {
     // stamped Pose message
@@ -608,6 +617,11 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     prev_angle = tf2::getYaw(f2b_.getRotation());
 
     odom_publisher_->publish(odom_msg);
+
+    // RCLCPP_INFO(get_logger(), 
+    //   "odom published to %s...",
+    //   odom_topic_.c_str()
+    // );
   }
 
   if (publish_tf_)
@@ -634,11 +648,8 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
    * To compute the history edges we do scan matching between the current scan
    * and one from a previous one (stores in `history_pre_ldp_scan_` array)
    * 
-   * 
-   * TODO:
-   * -  What about history_pre_ld_scan_[0]? 
-   * - only create history edge if new kf is needed
-  *************************************************************************************************/
+   * What about history_pre_ld_scan_[0]? It is not use (kind of a waste...)
+   ************************************************************************************************/
   for(int i = 1; i <= history_; i++) {
     
     input_.laser_ref = history_pre_ldp_scan_[i];
@@ -659,7 +670,7 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     input_.first_guess[0] = pr_ch_l_e.getOrigin().getX();
     input_.first_guess[1] = pr_ch_l_e.getOrigin().getY();
     input_.first_guess[2] = tf2::getYaw(pr_ch_l_e.getRotation());
-
+    
     // TODO: Don't we need to free the covariance matrices?
 
     // scan matching
@@ -817,6 +828,62 @@ void LaserScanMatcher::createTfFromXYTheta(double x, double y, double theta, tf2
   q.setRPY(0.0, 0.0, theta);
   t.setRotation(q);
 }
+
+
+// returns the predicted change in pose (in fixed frame)
+// since the last time we did icp
+void LaserScanMatcher::getPrediction(
+  double& pr_ch_x, double& pr_ch_y, double& pr_ch_a, double dt)
+{
+  std::unique_lock<std::mutex> prediction_mutex_;
+
+  // **** base case - no input available, use zero-motion model
+  pr_ch_x = 0.0;
+  pr_ch_y = 0.0;
+  pr_ch_a = 0.0;
+
+  // **** use velocity (for example from ab-filter)
+  // if (use_vel_)
+  // {
+  //   pr_ch_x = dt * latest_vel_msg_.linear.x;
+  //   pr_ch_y = dt * latest_vel_msg_.linear.y;
+  //   pr_ch_a = dt * latest_vel_msg_.angular.z;
+
+  //   if      (pr_ch_a >= M_PI) pr_ch_a -= 2.0 * M_PI;
+  //   else if (pr_ch_a < -M_PI) pr_ch_a += 2.0 * M_PI;
+  // }
+
+  // **** use wheel odometry
+  if (use_odom_ && received_odom_)
+  {
+    pr_ch_x = latest_odom_msg_.pose.pose.position.x -
+              last_used_odom_msg_.pose.pose.position.x;
+
+    pr_ch_y = latest_odom_msg_.pose.pose.position.y -
+              last_used_odom_msg_.pose.pose.position.y;
+
+    pr_ch_a = tf2::getYaw(latest_odom_msg_.pose.pose.orientation) -
+              tf2::getYaw(last_used_odom_msg_.pose.pose.orientation);
+
+    if      (pr_ch_a >= M_PI) pr_ch_a -= 2.0 * M_PI;
+    else if (pr_ch_a < -M_PI) pr_ch_a += 2.0 * M_PI;
+
+    last_used_odom_msg_ = latest_odom_msg_;
+  }
+
+  // **** use imu
+  // if (use_imu_ && received_imu_)
+  // {
+  //   pr_ch_a = tf::getYaw(latest_imu_msg_.orientation) -
+  //             tf::getYaw(last_used_imu_msg_.orientation);
+
+  //   if      (pr_ch_a >= M_PI) pr_ch_a -= 2.0 * M_PI;
+  //   else if (pr_ch_a < -M_PI) pr_ch_a += 2.0 * M_PI;
+
+  //   last_used_imu_msg_ = latest_imu_msg_;
+  // }
+}
+
 
 
 }  // namespace scan_tools

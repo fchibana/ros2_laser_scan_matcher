@@ -139,6 +139,7 @@ private:
   bool use_odom_;
   bool received_odom_;
   std::mutex mutex_;
+  std::mutex prediction_mutex_;
 
   // For messages with covariance 
   std::vector<double> position_covariance_;
@@ -182,6 +183,7 @@ private:
     bool read_only = false);
   void createCache (const sensor_msgs::msg::LaserScan::SharedPtr& scan_msg);
 
+  void getPrediction(double& pr_ch_x, double& pr_ch_y, double& pr_ch_a, double dt);
 
 };  // LaserScanMatcher
 
