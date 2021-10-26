@@ -80,12 +80,14 @@ private:
   tf2::Transform laser_to_base_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_stamped_publisher_;
   // Coordinate parameters
   std::string map_frame_;
   std::string base_frame_;
   std::string odom_frame_;
   std::string laser_frame_;
   std::string odom_topic_;
+  std::string pose_stamped_topic_;
 
   // Keyframe parameters
   double kf_dist_linear_;
@@ -115,6 +117,7 @@ private:
   bool initialized_;
   bool publish_odom_;
   bool publish_tf_;
+  bool publish_pose_stamped_;
 
   tf2::Transform f2b_;     // fixed-to-base tf (pose of base frame in fixed frame)
   tf2::Transform f2b_kf_;  // pose of the last keyframe scan in fixed frame
@@ -134,42 +137,6 @@ private:
 
 
   rclcpp::Time last_icp_time_;
-
-  /*************************************************************************************************
-   * (@fchibana) New stuff
-   * 
-   * Notes
-   * - If we create and publish the edge history edge messages in the same scope, we don't need
-   *   to declare them as member variables.
-  *************************************************************************************************/ 
-
-  // For messages with covariance
-  std::vector<double> position_covariance_;
-  std::vector<double> orientation_covariance_;
-
-  // Publishing pose stamped (for mapping?)
-  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_stamped_publisher_;
-  std::string pose_stamped_topic_;
-  bool publish_pose_stamped_;
-
-  // # stuff for slam (move somewhere else?)
-
-  // ## publish edge
-  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr edge_publisher_;
-  geometry_msgs::msg::PoseWithCovarianceStamped edge_stamped_msg_;  // FIXME(): needs to be member var?
-
-
-  // ## publish history edges
-  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr h_edge_publisher_;
-  geometry_msgs::msg::PoseWithCovarianceStamped h_edge_stamped_msg_[50];  // FIXME(): needs to be member var?
-  int history_;
-  LDP history_pre_ldp_scan_[50];
-  tf2::Transform corr_ch_l_old_[50];
-  // sensor_msgs::msg::LaserScan::ConstPtr scan_msg_global_;
-  sensor_msgs::msg::LaserScan::SharedPtr scan_msg_global_;
-  // sensor_msgs::msg::LaserScan::ConstPtr scan_msgs_[50];
-  sensor_msgs::msg::LaserScan::SharedPtr scan_msgs_[50];
-  /************************************************************************************************/
 
   bool getBaseToLaserTf (const std::string& frame_id);
 
