@@ -51,6 +51,11 @@
 
 #include <csm/csm.h>  // csm defines min and max, but Eigen complains
 #include <boost/thread.hpp>
+#include <boost/assign.hpp>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 
 namespace scan_tools
@@ -67,24 +72,42 @@ private:
   // Ros handle
 
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_filter_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
 
   std::shared_ptr<tf2_ros::TransformListener> tf_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tfB_;
   tf2::Transform base_to_laser_;  // static, cached
-  tf2::Transform laser_to_base_; 
+  tf2::Transform laser_to_base_;
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_publisher_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_stamped_publisher_;
   // Coordinate parameters
   std::string map_frame_;
   std::string base_frame_;
   std::string odom_frame_;
   std::string laser_frame_;
   std::string odom_topic_;
+  std::string pose_stamped_topic_;
 
   // Keyframe parameters
   double kf_dist_linear_;
   double kf_dist_linear_sq_;
   double kf_dist_angular_;
+
+  // What predictions are available to speed up the ICP?
+  // 1) (todo) imu - [theta] from imu yaw angle - /imu topic
+  // 2) odom - [x, y, theta] from wheel odometry - /odom topic
+  // If more than one is enabled, priority is imu > odom
+
+  bool use_odom_;
+
+  bool received_odom_;
+
+  std::mutex odom_mutex_;
+  std::mutex prediction_mutex_;
+
+  nav_msgs::msg::Odometry latest_odom_msg_;
+  nav_msgs::msg::Odometry last_used_odom_msg_;
 
   // For calculating odometry
   double prev_x;
@@ -94,6 +117,7 @@ private:
   bool initialized_;
   bool publish_odom_;
   bool publish_tf_;
+  bool publish_pose_stamped_;
 
   tf2::Transform f2b_;     // fixed-to-base tf (pose of base frame in fixed frame)
   tf2::Transform f2b_kf_;  // pose of the last keyframe scan in fixed frame
@@ -128,7 +152,8 @@ private:
     bool read_only = false);
   void createCache (const sensor_msgs::msg::LaserScan::SharedPtr& scan_msg);
 
-
+  void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom_msg);
+  void getPrediction(double& pr_ch_x, double& pr_ch_y, double& pr_ch_a, double dt);
 };  // LaserScanMatcher
 
 }  // namespace scan_tools

@@ -36,7 +36,7 @@
  */
 
 #include "ros2_laser_scan_matcher/laser_scan_matcher.h"
- 
+
 #undef min
 #undef max
 
@@ -59,7 +59,9 @@ void LaserScanMatcher::add_parameter(
   }
 
 
-LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(false), prev_angle(0.0), prev_x(0.0), prev_y(0.0)
+LaserScanMatcher::LaserScanMatcher()
+: Node("laser_scan_matcher"),
+  initialized_(false), prev_angle(0.0), prev_x(0.0), prev_y(0.0), received_odom_(false)
 {
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   // Initiate parameters
@@ -69,7 +71,9 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
     "If publish odometry from laser_scan. Empty if not, otherwise name of the topic");
   add_parameter("publish_tf",   rclcpp::ParameterValue(false),
     " If publish tf odom->base_link");
-  
+  add_parameter("publish_pose_stamped", rclcpp::ParameterValue(std::string("")),
+    "If publish pose_stamped from laser_scan. Empty if not, otherwise name of the topic");
+
   add_parameter("base_frame", rclcpp::ParameterValue(std::string("base_link")),
     "Which frame to use for the robot base");
   add_parameter("odom_frame", rclcpp::ParameterValue(std::string("odom")),
@@ -82,12 +86,18 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
     "When to generate keyframe scan.");
   add_parameter("kf_dist_angular", rclcpp::ParameterValue(10.0* (M_PI/180.0)),
     "When to generate keyframe scan.");
-  
+
+  // What predictions are available to speed up the ICP?
+  // 1) (todo) imu - [theta] from imu yaw angle - /imu topic
+  // 2) odom - [x, y, theta] from wheel odometry - /odom topic
+  // If more than one is enabled, priority is imu > odom
+  add_parameter("use_odom", rclcpp::ParameterValue(true),
+    "Use wheel odometry to speed up ICP.");
 
 
   // CSM parameters - comments copied from algos.h (by Andrea Censi)
   add_parameter("max_angular_correction_deg", rclcpp::ParameterValue(45.0),
-    "Maximum angular displacement between scansr.");
+    "Maximum angular displacement between scans.");
 
   add_parameter("max_linear_correction", rclcpp::ParameterValue(0.5),
     "Maximum translation between scans (m).");
@@ -191,8 +201,12 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
   kf_dist_linear_  = this->get_parameter("kf_dist_linear").as_double();
   kf_dist_angular_ = this->get_parameter("kf_dist_angular").as_double();
   odom_topic_   = this->get_parameter("publish_odom").as_string();
-  publish_tf_   = this->get_parameter("publish_tf").as_bool(); 
+  publish_tf_   = this->get_parameter("publish_tf").as_bool();
+  pose_stamped_topic_  = this->get_parameter("publish_pose_stamped").as_string();
 
+  use_odom_ = this->get_parameter("use_odom").as_bool();
+
+  publish_pose_stamped_ = (pose_stamped_topic_ != "");
   publish_odom_ = (odom_topic_ != "");
   kf_dist_linear_sq_ = kf_dist_linear_ * kf_dist_linear_;
 
@@ -244,11 +258,23 @@ LaserScanMatcher::LaserScanMatcher() : Node("laser_scan_matcher"), initialized_(
   // Subscribers
   this->scan_filter_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>("scan", 5, std::bind(&LaserScanMatcher::scanCallback, this, std::placeholders::_1));
   tf_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+  if (use_odom_) {
+    RCLCPP_INFO(get_logger(), "Using wheel odometry as initial guess for ICP");
+    this->odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+      "odom", rclcpp::SensorDataQoS(),
+      std::bind(&LaserScanMatcher::odomCallback, this, std::placeholders::_1));
+  }
+
+  // Publishers
   if (publish_tf_)
     tfB_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
   if(publish_odom_){
-    // odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, rclcpp::SensorDataQoS());
-    odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 32); // (fabio) fix sync issue with hdl
+    odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, rclcpp::SensorDataQoS());
+  }
+  if(publish_pose_stamped_) {
+    pose_stamped_publisher_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+      pose_stamped_topic_, 5);
   }
 }
 
@@ -257,6 +283,16 @@ LaserScanMatcher::~LaserScanMatcher()
 
 }
 
+void LaserScanMatcher::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom_msg)
+{
+  std::lock_guard<std::mutex> lock(odom_mutex_);
+  latest_odom_msg_ = *odom_msg;
+  if (!received_odom_)
+  {
+    last_used_odom_msg_ = *odom_msg;
+    received_odom_ = true;
+  }
+}
 
 
 void LaserScanMatcher::createCache (const sensor_msgs::msg::LaserScan::SharedPtr& scan_msg)
@@ -277,7 +313,6 @@ void LaserScanMatcher::createCache (const sensor_msgs::msg::LaserScan::SharedPtr
 
 
 void LaserScanMatcher::scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr scan_msg)
-
 {
 
   if (!initialized_)
@@ -366,12 +401,18 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
 
   double dt = (now() - last_icp_time_).nanoseconds()/1e+9;
   double pr_ch_x, pr_ch_y, pr_ch_a;
+  getPrediction(pr_ch_x, pr_ch_y, pr_ch_a, dt);
   
+  RCLCPP_DEBUG(
+    get_logger(),
+    "pr ch (x, y, yaw): (%f, %f, %f)",
+    pr_ch_x, pr_ch_y, pr_ch_a
+  );
 
   // the predicted change of the laser's position, in the fixed frame
 
   tf2::Transform pr_ch;
-  createTfFromXYTheta(0.0,0.0,0.0, pr_ch);
+  createTfFromXYTheta(pr_ch_x, pr_ch_y, pr_ch_a, pr_ch);
 
   // account for the change since the last kf, in the fixed frame
 
@@ -432,7 +473,7 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
 
   if (publish_odom_)
   {
-    // stamped Pose message
+    // Odometry message
     nav_msgs::msg::Odometry odom_msg;
 
     odom_msg.header.stamp    = time;
@@ -478,6 +519,20 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     tfB_->sendTransform (tf_msg);
   }
 
+
+  if (publish_pose_stamped_)
+  {
+    // stamped Pose message
+    geometry_msgs::msg::PoseStamped pose_stamped_msg;
+    
+    pose_stamped_msg.header.stamp = time;
+    pose_stamped_msg.header.frame_id = odom_frame_;
+    tf2::toMsg(f2b_, pose_stamped_msg.pose);
+
+    pose_stamped_publisher_->publish(pose_stamped_msg);
+  }
+
+  
   // **** swap old and new
   if (newKeyframeNeeded(corr_ch))
   {
@@ -555,6 +610,49 @@ void LaserScanMatcher::createTfFromXYTheta(double x, double y, double theta, tf2
 }
 
 
+// returns the predicted change in pose (in fixed frame)
+// since the last time we did icp
+void LaserScanMatcher::getPrediction(
+  double& pr_ch_x, double& pr_ch_y, double& pr_ch_a, double dt)
+{
+  // std::unique_lock<std::mutex> prediction_mutex_;
+  std::lock_guard<std::mutex> lock(prediction_mutex_);
+
+  // base case - no input available, use zero-motion model
+  pr_ch_x = 0.0;
+  pr_ch_y = 0.0;
+  pr_ch_a = 0.0;
+
+  // use wheel odometry
+  if (use_odom_ && received_odom_)
+  {
+    pr_ch_x = latest_odom_msg_.pose.pose.position.x -
+              last_used_odom_msg_.pose.pose.position.x;
+
+    pr_ch_y = latest_odom_msg_.pose.pose.position.y -
+              last_used_odom_msg_.pose.pose.position.y;
+
+    pr_ch_a = tf2::getYaw(latest_odom_msg_.pose.pose.orientation) -
+              tf2::getYaw(last_used_odom_msg_.pose.pose.orientation);
+
+    if      (pr_ch_a >= M_PI) pr_ch_a -= 2.0 * M_PI;
+    else if (pr_ch_a < -M_PI) pr_ch_a += 2.0 * M_PI;
+
+    last_used_odom_msg_ = latest_odom_msg_;
+  }
+
+  // TODO use imu
+  // if (use_imu_ && received_imu_)
+  // {
+  //   pr_ch_a = tf::getYaw(latest_imu_msg_.orientation) -
+  //             tf::getYaw(last_used_imu_msg_.orientation);
+
+  //   if      (pr_ch_a >= M_PI) pr_ch_a -= 2.0 * M_PI;
+  //   else if (pr_ch_a < -M_PI) pr_ch_a += 2.0 * M_PI;
+
+  //   last_used_imu_msg_ = latest_imu_msg_;
+  // }
+}
 }  // namespace scan_tools
 
 int main(int argc, char ** argv)

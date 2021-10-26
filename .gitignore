@@ -1,0 +1,40 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# VSCode
+.vscode
+build
+src/laser_scan_matcher_ros1.cpp
+include/ros2_laser_scan_matcher/laser_scan_matcher_bkp.h
+src/laser_scan_matcher_bkp.cpp
+include/ros2_laser_scan_matcher/laser_scan_matcher_ros1.h
