@@ -38,6 +38,7 @@
 #ifndef LASER_SCAN_MATCHER_LASER_SCAN_MATCHER_H
 #define LASER_SCAN_MATCHER_LASER_SCAN_MATCHER_H
 
+#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <geometry_msgs/msg/pose.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -73,6 +74,7 @@ private:
 
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_filter_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
 
   std::shared_ptr<tf2_ros::TransformListener> tf_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tfB_;
@@ -93,17 +95,22 @@ private:
   double kf_dist_angular_;
 
   // What predictions are available to speed up the ICP?
-  // 1) (todo) imu - [theta] from imu yaw angle - /imu topic
+  // 1) imu - [theta] from imu yaw angle - /imu topic
   // 2) odom - [x, y, theta] from wheel odometry - /odom topic
   // If more than one is enabled, priority is imu > odom
 
+  bool use_imu_;
   bool use_odom_;
 
+  bool received_imu_;
   bool received_odom_;
 
+  std::mutex imu_mutex_;
   std::mutex odom_mutex_;
   std::mutex prediction_mutex_;
 
+  sensor_msgs::msg::Imu latest_imu_msg_;
+  sensor_msgs::msg::Imu last_used_imu_msg_;
   nav_msgs::msg::Odometry latest_odom_msg_;
   nav_msgs::msg::Odometry last_used_odom_msg_;
 
@@ -185,6 +192,7 @@ private:
     bool read_only = false);
   void createCache (const sensor_msgs::msg::LaserScan::SharedPtr& scan_msg);
 
+  void imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg);  
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom_msg);
   void getPrediction(double& pr_ch_x, double& pr_ch_y, double& pr_ch_a, double dt);
 };  // LaserScanMatcher

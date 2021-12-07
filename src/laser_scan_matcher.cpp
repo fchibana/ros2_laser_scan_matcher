@@ -61,7 +61,8 @@ void LaserScanMatcher::add_parameter(
 
 LaserScanMatcher::LaserScanMatcher()
 : Node("laser_scan_matcher"),
-  initialized_(false), prev_angle(0.0), prev_x(0.0), prev_y(0.0), received_odom_(false)
+  initialized_(false), prev_angle(0.0), prev_x(0.0), prev_y(0.0),
+  received_odom_(false), received_imu_(false)
 {
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   // Initiate parameters
@@ -91,6 +92,8 @@ LaserScanMatcher::LaserScanMatcher()
   // 1) (todo) imu - [theta] from imu yaw angle - /imu topic
   // 2) odom - [x, y, theta] from wheel odometry - /odom topic
   // If more than one is enabled, priority is imu > odom
+  add_parameter("use_imu", rclcpp::ParameterValue(false),
+    "Use IMU to speed up ICP.");
   add_parameter("use_odom", rclcpp::ParameterValue(true),
     "Use wheel odometry to speed up ICP.");
 
@@ -204,6 +207,7 @@ LaserScanMatcher::LaserScanMatcher()
   publish_tf_   = this->get_parameter("publish_tf").as_bool();
   pose_stamped_topic_  = this->get_parameter("publish_pose_stamped").as_string();
 
+  use_imu_ = this->get_parameter("use_imu").as_bool();
   use_odom_ = this->get_parameter("use_odom").as_bool();
 
   publish_pose_stamped_ = (pose_stamped_topic_ != "");
@@ -245,6 +249,10 @@ LaserScanMatcher::LaserScanMatcher()
 
   f2b_.setIdentity();
   f2b_kf_.setIdentity();
+  // HACK(): smart agri's pose t0
+  // createTfFromXYTheta(-0.015686431899666786, -0.9757660627365112, 3.09533, f2b_kf_);
+  // f2b_ = f2b_kf_;
+  
   input_.laser[0] = 0.0;
   input_.laser[1] = 0.0;
   input_.laser[2] = 0.0;
@@ -259,6 +267,12 @@ LaserScanMatcher::LaserScanMatcher()
   this->scan_filter_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>("scan", 5, std::bind(&LaserScanMatcher::scanCallback, this, std::placeholders::_1));
   tf_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
+  if (use_imu_) {
+    RCLCPP_INFO(get_logger(), "Using IMU as initial guess for ICP");
+    this->imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+      "imu/data", rclcpp::SensorDataQoS() /*or 1?*/,
+      std::bind(&LaserScanMatcher::imuCallback, this, std::placeholders::_1));
+  }
   if (use_odom_) {
     RCLCPP_INFO(get_logger(), "Using wheel odometry as initial guess for ICP");
     this->odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -304,6 +318,56 @@ LaserScanMatcher::LaserScanMatcher()
 LaserScanMatcher::~LaserScanMatcher()
 {
 
+}
+
+void LaserScanMatcher::imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu_msg)
+{
+  // transform imu to base_frame
+  // geometry_msgs::msg::TransformStamped imu2base;
+  // sensor_msgs::msg::Imu imu_transf;
+  // try {
+  //   imu2base = tf_buffer_->lookupTransform(
+  //     base_frame_, imu_msg->header.frame_id, tf2::TimePointZero
+  //   );
+  //   tf2::doTransform(imu_msg->orientation, imu_transf.orientation, imu2base);
+  //   tf2::doTransform()
+  // } catch (tf2::TransformException & ex) {
+  //   RCLCPP_WARN(
+  //     get_logger(),
+  //     "Skipping IMU message. Could not get transform from imu to base frame: %s",
+  //     ex.what()
+  //   );
+  //   return;
+  // }
+  // geometry_msgs::msg::TransformStamped imu2base;
+  // // sensor_msgs::msg::Imu imu_transf;
+  // try {
+  //   imu2base = tf_buffer_->lookupTransform(
+  //     base_frame_, imu_msg->header.frame_id, tf2::TimePointZero
+  //   );
+  //   // tf2::doTransform(imu_msg->orientation, imu_transf.orientation, imu2base);
+  // } catch (tf2::TransformException & ex) {
+  //   RCLCPP_WARN(
+  //     get_logger(),
+  //     "Skipping IMU message. Could not get transform from imu to base frame: %s",
+  //     ex.what()
+  //   );
+  //   return;
+  // }
+  
+  std::lock_guard<std::mutex> lock(imu_mutex_);
+  // latest_imu_msg_ = imu_transf;
+  latest_imu_msg_ = *imu_msg;
+  // latest_imu_msg_.orientation = imu2base.transform.rotation;
+  // latest_imu_msg_.orientation.w = imu2base.transform.rotation.w;
+  // latest_imu_msg_.orientation.x = imu2base.transform.rotation.x;
+  // latest_imu_msg_.orientation.y = imu2base.transform.rotation.y;
+  // latest_imu_msg_.orientation.z = imu2base.transform.rotation.z;
+  
+  if (!received_imu_) {
+    last_used_imu_msg_ = *imu_msg;
+    received_imu_ = true;
+  }
 }
 
 void LaserScanMatcher::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom_msg)
@@ -450,11 +514,11 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
   double pr_ch_x, pr_ch_y, pr_ch_a;
   getPrediction(pr_ch_x, pr_ch_y, pr_ch_a, dt);
   
-  RCLCPP_DEBUG(
-    get_logger(),
-    "pr ch (x, y, yaw): (%f, %f, %f)",
-    pr_ch_x, pr_ch_y, pr_ch_a
-  );
+  // RCLCPP_INFO(
+  //   get_logger(),
+  //   "pr ch (x, y, yaw): (%f, %f, %f)",
+  //   pr_ch_x, pr_ch_y, pr_ch_a
+  // );
 
   // the predicted change of the laser's position, in the fixed frame
 
@@ -527,12 +591,12 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
      **********************************************************************************************/
     
     // HACK(): debugging
-    RCLCPP_INFO(
-      get_logger(),
-      "scan matching (error, n. iter.): (%f, %i)",
-      output_.error, 
-      output_.iterations
-    );
+    // RCLCPP_INFO(
+    //   get_logger(),
+    //   "scan matching (error, n. iter.): (%f, %i)",
+    //   output_.error, 
+    //   output_.iterations
+    // );
         
     edge_stamped_msg_.header.stamp = time;
     edge_stamped_msg_.header.frame_id = base_frame_;
@@ -741,7 +805,7 @@ bool LaserScanMatcher::processScan(LDP& curr_ldp_scan, const rclcpp::Time& time)
     usleep(3000);
     edge_publisher_->publish(edge_stamped_msg_);
 
-    RCLCPP_INFO(get_logger(), "Published edge");
+    // RCLCPP_INFO(get_logger(), "Published edge");
     /**********************************************************************************************/
 
     // generate a keyframe
@@ -849,17 +913,17 @@ void LaserScanMatcher::getPrediction(
     last_used_odom_msg_ = latest_odom_msg_;
   }
 
-  // TODO use imu
-  // if (use_imu_ && received_imu_)
-  // {
-  //   pr_ch_a = tf::getYaw(latest_imu_msg_.orientation) -
-  //             tf::getYaw(last_used_imu_msg_.orientation);
+  // use imu
+  if (use_imu_ && received_imu_)
+  {
+    pr_ch_a = tf2::getYaw(latest_imu_msg_.orientation) -
+              tf2::getYaw(last_used_imu_msg_.orientation);
 
-  //   if      (pr_ch_a >= M_PI) pr_ch_a -= 2.0 * M_PI;
-  //   else if (pr_ch_a < -M_PI) pr_ch_a += 2.0 * M_PI;
+    if      (pr_ch_a >= M_PI) pr_ch_a -= 2.0 * M_PI;
+    else if (pr_ch_a < -M_PI) pr_ch_a += 2.0 * M_PI;
 
-  //   last_used_imu_msg_ = latest_imu_msg_;
-  // }
+    last_used_imu_msg_ = latest_imu_msg_;
+  }
 }
 }  // namespace scan_tools
 
